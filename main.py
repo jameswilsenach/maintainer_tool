@@ -24,6 +24,12 @@ import logfire
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
 
 # ---------------------------------------------------------
+# GLOBAL DEFAULTS
+# ---------------------------------------------------------
+PAGE_SIZE = 1            # Number of issues to fetch per interactive batch (set to 1 for debugging/compute saving)
+MAX_CODE_FILES = 200     # Maximum number of remote Python files to parse via AST
+
+# ---------------------------------------------------------
 # DATA SCHEMAS
 # ---------------------------------------------------------
 
@@ -47,13 +53,12 @@ class IssueDigest(BaseModel):
 # ---------------------------------------------------------
 
 def setup_logging(repo: str):
-    """Configures Logfire to write to a local file and enables LiteLLM debugging."""
-    # Turn on LiteLLM's verbose stdout debugging
-    litellm._turn_on_debug()
+    """Configures Logfire to write to a local file. Removes noisy LiteLLM stdout."""
+    # Suppress ALL noisy internal LiteLLM warnings and stack traces
+    litellm.suppress_debug_info = True
     
-    # Hook LiteLLM directly into Logfire
-    litellm.success_callback = ["logfire"]
-    litellm.failure_callback = ["logfire"]
+    # We removed the litellm callbacks that cause the LOGFIRE_TOKEN crash.
+    # We rely entirely on our manual logfire.info() calls to keep logs clean.
 
     # Ensure the logs directory exists
     os.makedirs("logs", exist_ok=True)
@@ -73,19 +78,25 @@ def setup_logging(repo: str):
             SimpleSpanProcessor(ConsoleSpanExporter(out=log_file))
         ]
     )
-    print(f"-> Diagnostics enabled. Logs saving to: {os.path.abspath(log_path)}")
+    logfire.info("Diagnostics enabled. Logs saving to: {log_path}", log_path=os.path.abspath(log_path))
 
 def load_environment() -> Dict[str, str]:
     """Loads environment variables securely."""
-    if os.path.exists(".my_env"):
-        load_dotenv(dotenv_path=".my_env")
+    # Force the .env file to overwrite any old terminal session variables
+    if os.path.exists(".env"):
+        load_dotenv(dotenv_path=".env", override=True)
     else:
-        load_dotenv()
+        load_dotenv(override=True)
 
     token = os.getenv("GITHUB_TOKEN")
     if not token:
+        # Before logging is initialized, we use standard print
         print("ERROR: GITHUB_TOKEN not found. Please check your .env file.")
         sys.exit(1)
+        
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+    if anthropic_key:
+        print(f"-> [Debug] Loaded Anthropic Key: {anthropic_key[:10]}... (Length: {len(anthropic_key)})")
 
     return {
         "GITHUB_TOKEN": token,
@@ -102,7 +113,6 @@ def digest_issue_text(issue_title: str, issue_body: str, model_name: str) -> Iss
     """
     Uses an LLM wrapped in Instructor to extract structured RAG metadata from an issue.
     """
-    # Wrap LiteLLM with Instructor for native Pydantic support across providers
     client = instructor.from_litellm(litellm.completion)
     
     # Bounded behavior: truncate massive stack traces to save tokens
@@ -123,12 +133,12 @@ def digest_issue_text(issue_title: str, issue_body: str, model_name: str) -> Iss
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            max_retries=2 # Automatically retry if the LLM hallucinates schema
+            max_retries=2
         )
         return digest
     except Exception as e:
-        print(f"[dim red]LLM parsing failed for issue: {e}. Falling back to default.[/dim red]")
-        # Graceful fallback if the API fails
+        # Logfire natively captures the error cleanly without blowing up the terminal
+        logfire.error("LLM parsing failed for issue. Error details: {e}", e=str(e))
         return IssueDigest(
             key_phrases=[issue_title], 
             code_reasoning="None", 
@@ -144,13 +154,13 @@ def fetch_repo_readme(repo: str, headers: Dict[str, str]) -> str:
     readme_headers = headers.copy()
     readme_headers["Accept"] = "application/vnd.github.v3.raw"
     
-    print(f"Fetching README for {repo}...")
+    logfire.info("Fetching README for {repo}...", repo=repo)
     try:
         response = requests.get(url, headers=readme_headers, timeout=10)
         response.raise_for_status()
         return response.text
     except requests.exceptions.RequestException as e:
-        print(f"Warning: Could not fetch README. Details: {e}")
+        logfire.warn("Could not fetch README. Details: {e}", e=str(e))
         return ""
 
 def fetch_github_issues(repo: str, headers: Dict[str, str], limit: int = 5, page: int = 1) -> List[Dict[str, Any]]:
@@ -163,18 +173,18 @@ def fetch_github_issues(repo: str, headers: Dict[str, str], limit: int = 5, page
         "page": page
     }
     
-    print(f"Fetching {limit} issues from {repo} (Page {page})...")
+    logfire.info("Fetching {limit} issues from {repo} (Page {page})...", limit=limit, repo=repo, page=page)
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         issues = response.json()
         return [issue for issue in issues if "pull_request" not in issue]
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching issues: {e}")
+        logfire.error("Error fetching issues: {e}", e=str(e))
         sys.exit(1)
 
 def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: int = 200) -> List[Dict[str, str]]:
-    print(f"Fetching repository tree for {repo}...")
+    logfire.info("Fetching repository tree for {repo}...", repo=repo)
     try:
         repo_info = requests.get(f"https://api.github.com/repos/{repo}", headers=headers, timeout=10).json()
         branch = repo_info.get("default_branch", "main")
@@ -192,7 +202,7 @@ def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: in
         if not target_files:
             return []
             
-        print(f"-> AST parsing {len(target_files)} remote Python files (Max={max_files})...")
+        logfire.info("AST parsing {count} remote Python files (Max={max_files})...", count=len(target_files), max_files=max_files)
         
         chunks = []
         file_headers = headers.copy()
@@ -222,7 +232,7 @@ def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: in
                 progress.advance(task)
         return chunks
     except Exception as e:
-        print(f"Warning: Remote codebase indexing failed ({e}).")
+        logfire.warn("Remote codebase indexing failed ({e}).", e=str(e))
         return []
 
 # ---------------------------------------------------------
@@ -269,7 +279,8 @@ def main():
     
     parser = argparse.ArgumentParser(description="AI-powered GitHub Issue Triage Agent.")
     parser.add_argument("--repo", type=str, default=config["TARGET_REPO"])
-    parser.add_argument("--chunk_size", type=int, default=5)
+    parser.add_argument("--page_size", type=int, default=PAGE_SIZE, help="Number of issues to fetch per batch")
+    parser.add_argument("--max_code_files", type=int, default=MAX_CODE_FILES, help="Maximum number of remote Python files to index")
     args = parser.parse_args()
 
     if not args.repo:
@@ -284,47 +295,47 @@ def main():
         "Accept": "application/vnd.github.v3+json"
     }
 
-    print(f"\n--- Initializing Triage Pipeline for {args.repo} ---")
+    logfire.info("--- Initializing Triage Pipeline for {repo} ---", repo=args.repo)
     
     readme_markdown = fetch_repo_readme(args.repo, headers)
     doc_chunks = chunk_by_headers(readme_markdown)
-    print(f"-> Parsed README into {len(doc_chunks)} chunks.")
+    logfire.info("Parsed README into {count} chunks.", count=len(doc_chunks))
     
-    code_chunks = fetch_remote_python_chunks(args.repo, headers, max_files=200)
-    print(f"-> Indexed {len(code_chunks)} code chunks.")
+    code_chunks = fetch_remote_python_chunks(args.repo, headers, max_files=args.max_code_files)
+    logfire.info("Indexed {count} code chunks.", count=len(code_chunks))
     
     page = 1
     while True:
-        print(f"\n=== Fetching Batch {page} ===")
-        issues = fetch_github_issues(args.repo, headers, limit=args.chunk_size, page=page)
+        logfire.info("=== Fetching Batch {page} ===", page=page)
+        issues = fetch_github_issues(args.repo, headers, limit=args.page_size, page=page)
         
         if not issues:
-            print("\n[success] No more active issues found. Triage complete![/success]")
+            logfire.info("No more active issues found. Triage complete!")
             break
             
         for i, sample_issue in enumerate(issues, 1):
             issue_title = sample_issue['title']
             issue_body = sample_issue.get('body', '')
-            print(f"\n[Test] Issue #{sample_issue['number']}: {issue_title}")
+            logfire.info("[Test] Issue #{number}: {title}", number=sample_issue['number'], title=issue_title)
             
             # 1. Digest the Issue Text
             digest = digest_issue_text(issue_title, issue_body, config["MODEL_NAME"])
             
-            print(f"  -> Generated Phrases:  {', '.join(digest.key_phrases)}")
-            print(f"  -> Extracted Code:     {digest.code[0] if digest.code else 'None'}")
-            print(f"  -> LLM Reasoning:      {digest.code_reasoning[:120]}...")
+            logfire.info("  -> Generated Phrases:  {phrases}", phrases=', '.join(digest.key_phrases))
+            logfire.info("  -> Extracted Code:     {code}", code=digest.code[0] if digest.code else 'None')
+            logfire.info("  -> LLM Reasoning:      {reasoning}", reasoning=digest.code_reasoning[:120] + '...')
             
             # 2. Search using LLM-extracted Key Phrases (Query Rewriting)
             search_query = " ".join(digest.key_phrases)
             
             relevant_docs = search_repo_docs(search_query, doc_chunks, top_k=1)
-            print(f"  -> Docs Match:         '{relevant_docs[0]['section_header'] if relevant_docs else 'None'}'")
+            logfire.info("  -> Docs Match:         '{match}'", match=relevant_docs[0]['section_header'] if relevant_docs else 'None')
                 
             relevant_code = search_repo_docs(search_query, code_chunks, top_k=1)
-            print(f"  -> Code Match:         '{relevant_code[0]['section_header'] if relevant_code else 'None'}'")
+            logfire.info("  -> Code Match:         '{match}'", match=relevant_code[0]['section_header'] if relevant_code else 'None')
         
         print("\n" + "-"*50)
-        user_input = input(f"Press [Enter] to fetch the next {args.chunk_size} issues, or type 'exit' to quit: ").strip().lower()
+        user_input = input(f"Press [Enter] to fetch the next {args.page_size} issues, or type 'exit' to quit: ").strip().lower()
         if user_input == 'exit':
             break
         page += 1
