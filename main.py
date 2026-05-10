@@ -178,13 +178,13 @@ def digest_issue_text(issue_title: str, issue_body: str, model_name: str) -> Iss
         
         if "not_found_error" in error_msg and "model" in error_msg:
             print("\n" + "!"*60)
-            print("🚨 MODEL NOT FOUND ERROR 🚨")
+            print("MODEL NOT FOUND ERROR")
             print(f"The API rejected the model name: '{model_name}'")
             print("Anthropic often deprecates older model versions. Please update your .env file.")
             print("!"*60 + "\n")
         elif "invalid x-api-key" in error_msg or "authentication_error" in error_msg:
             print("\n" + "!"*60)
-            print("🚨 ANTHROPIC AUTHENTICATION ERROR 🚨")
+            print("ANTHROPIC AUTHENTICATION ERROR")
             print("Anthropic actively rejected your key.")
             print("!"*60 + "\n")
             
@@ -241,7 +241,8 @@ def fetch_repo_readme(repo: str, headers: Dict[str, str]) -> str:
     except requests.exceptions.RequestException:
         return ""
 
-def fetch_github_issues(repo: str, headers: Dict[str, str], limit: int = 5, page: int = 1) -> List[Dict[str, Any]]:
+def fetch_github_issues(repo: str, headers: Dict[str, str], limit: int = 30, page: int = 1) -> List[Dict[str, Any]]:
+    """Fetches a larger batch of issues to populate the processing buffer."""
     url = f"https://api.github.com/repos/{repo}/issues"
     params = {"state": "open", "sort": "created", "direction": "desc", "per_page": limit, "page": page}
     try:
@@ -342,8 +343,10 @@ def main():
     
     parser = argparse.ArgumentParser(description="AI-powered GitHub Issue Triage Agent.")
     parser.add_argument("--repo", type=str, default=config["TARGET_REPO"])
-    parser.add_argument("--page_size", type=int, default=PAGE_SIZE, help="Number of issues to fetch per batch")
+    parser.add_argument("--page_size", type=int, default=PAGE_SIZE, help="Number of valid issues to process per interactive batch")
     parser.add_argument("--max_code_files", type=int, default=MAX_CODE_FILES, help="Maximum number of remote Python files to index")
+    parser.add_argument("--start_issue", type=int, default=None, help="Optional starting issue number. Newer issues will be skipped.")
+    parser.add_argument("--include_labeled", action="store_true", help="If set, includes issues that already have labels (by default, labeled issues are skipped).")
     args = parser.parse_args()
 
     if not args.repo:
@@ -385,16 +388,40 @@ def main():
     
     all_chunks = doc_chunks + code_chunks
     
-    page = 1
+    api_page = 1
+    issue_buffer = []
+    
     while True:
-        print(f"\n=== Fetching Batch {page} ===")
-        issues = fetch_github_issues(args.repo, headers, limit=args.page_size, page=page)
-        
-        if not issues:
-            print("\n[success] No more active issues found. Triage complete![/success]")
+        # Fill the buffer until it has enough valid issues for the next batch display
+        while len(issue_buffer) < args.page_size:
+            issues = fetch_github_issues(args.repo, headers, limit=30, page=api_page)
+            if not issues:
+                break
+                
+            for issue in issues:
+                # Filter out issues newer than start_issue if provided
+                if args.start_issue and issue['number'] > args.start_issue:
+                    logfire.info("Skipping Issue #{num} (Newer than start_issue {start})", num=issue['number'], start=args.start_issue)
+                    continue
+                
+                # Filter out issues that already have labels (assume already triaged)
+                if not args.include_labeled and issue.get('labels'):
+                    logfire.info("Skipping Issue #{num} (Already labeled/triaged)", num=issue['number'])
+                    continue
+                    
+                issue_buffer.append(issue)
+                
+            api_page += 1
+            
+        if not issue_buffer:
+            print("\n[SUCCESS] No more active issues found matching criteria. Triage complete!")
             break
             
-        for i, sample_issue in enumerate(issues, 1):
+        # Process the exact page size from the buffer
+        batch_to_process = issue_buffer[:args.page_size]
+        issue_buffer = issue_buffer[args.page_size:]
+            
+        for sample_issue in batch_to_process:
             issue_title = sample_issue['title']
             issue_body = sample_issue.get('body', '')
             
@@ -446,11 +473,13 @@ def main():
             with open(report_path, "a", encoding="utf-8") as f:
                 f.write(f"## Issue #{sample_issue['number']}: {issue_title}\n\n")
                 f.write(f"**Issue Summary:** {decision.issue_summary}\n\n")
-                f.write(f"- **Investigate Target:** `{decision.investigation_target}`\n")
-                f.write(f"- **GitHub Label:** `{decision.github_label}` (Reasoning: *{decision.label_reasoning}*)\n")
+                f.write(f"- **Investigate Target:** {decision.investigation_target}\n")
+                
+                # Render reasoning without italics to prevent inner markdown collision from the LLM
+                f.write(f"- **GitHub Label:** `{decision.github_label}` (Reasoning: {decision.label_reasoning})\n")
                 f.write(f"- **Further Info Required:** {missing_info_str}\n")
                 f.write(f"- **Upstream Risk:** {decision.upstream_risk}\n")
-                f.write(f"- **Triage Priority:** {decision.triage_priority} (Reasoning: *{decision.triage_reasoning}*)\n\n")
+                f.write(f"- **Triage Priority:** {decision.triage_priority} (Reasoning: {decision.triage_reasoning})\n\n")
                 
                 # Optionally add the key RAG references that led to this decision
                 if retrieved_chunks_payload:
@@ -472,18 +501,16 @@ def main():
             }
             json_report_data.append(issue_record)
 
-            # Iterative save ensures data isn't lost if the script is interrupted
             with open(report_json_path, "w", encoding="utf-8") as f:
                 json.dump(json_report_data, f, indent=2)
             
         print("\n" + "="*50)
-        user_input = input(f"Press [Enter] to fetch the next {args.page_size} issues, or type 'exit' to quit: ").strip().lower()
+        user_input = input(f"Press [Enter] to fetch the next {args.page_size} valid issues, or type 'exit' to quit: ").strip().lower()
         if user_input == 'exit':
             print(f"\nReports completed and safely stored at:")
             print(f"  - Markdown: {os.path.abspath(report_path)}")
             print(f"  - JSON:     {os.path.abspath(report_json_path)}")
             break
-        page += 1
 
 if __name__ == "__main__":
     main()
