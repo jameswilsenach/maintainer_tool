@@ -10,7 +10,7 @@ import re
 import ast
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Literal
 import requests
 from dotenv import load_dotenv
 from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn
@@ -42,10 +42,57 @@ class IssueDigest(BaseModel):
         description="A list of 3-5 specific keywords or phrases relevant to the issue (e.g., 'Leiden', 'clustering', 'modularity'). These will be used as semantic search queries."
     )
     code_reasoning: str = Field(
-        description="Reasoning that primes the agent to extract relevant code chunks or single functions referenced in the issue. If no specific code is referenced or obvious, explicitly output 'None'."
+        description="Brief reasoning (1-2 sentences max) that primes the agent to extract relevant code chunks or single functions referenced in the issue. If no specific code is referenced or obvious, explicitly output 'None'."
     )
     code: List[str] = Field(
         description="List of exact code snippets, function names, or stack traces found in the issue text. If no code is found, the first element MUST be 'None'."
+    )
+
+class RetrievedChunk(BaseModel):
+    """Represents a relevant section of code or documentation retrieved via RAG."""
+    source_file: str = Field(description="The filepath of the matched document or code.")
+    content: str = Field(description="The raw markdown text or Python source code of the chunk.")
+    line_number: Optional[int] = Field(default=None, description="The starting line number if it's a code chunk.")
+
+class TriageContext(BaseModel):
+    """
+    The complete, enriched context payload that will be fed to the final LLM 
+    for upstream issue determination and triage decisions.
+    """
+    issue_title: str
+    issue_body: str
+    extracted_key_phrases: List[str]
+    extracted_code_references: List[str]
+    retrieved_chunks: List[RetrievedChunk]
+
+class TriageResult(BaseModel):
+    """
+    The final triaged output containing actionable decisions for the maintainer.
+    Uses strict Literals to prevent LLM hallucination of categories.
+    """
+    issue_summary: str = Field(
+        description="A concise 1-2 sentence summary of the core issue being reported."
+    )
+    investigation_target: str = Field(
+        description="Specific coding lines, function names, or documentation sections to investigate based on the RAG context."
+    )
+    upstream_risk: Literal["Low", "Medium", "High"] = Field(
+        description="Risk that this issue is caused by an external dependency (upstream) rather than the core codebase."
+    )
+    triage_priority: Literal["Low", "Medium", "High"] = Field(
+        description="The priority level for addressing this issue."
+    )
+    triage_reasoning: str = Field(
+        description="Reasoning for the assigned triage priority and upstream risk."
+    )
+    github_label: Literal["bug", "enhancement", "documentation"] = Field(
+        description="The most appropriate GitHub label for this issue."
+    )
+    label_reasoning: str = Field(
+        description="Reasoning for the chosen GitHub label."
+    )
+    further_info_required: List[Literal["Code", "Error", "More information"]] = Field(
+        description="What additional information is needed from the user to reproduce or fix the issue? Leave empty if no further information is needed."
     )
 
 # ---------------------------------------------------------
@@ -71,9 +118,10 @@ def setup_logging(repo: str):
     log_file = open(log_path, "a", encoding="utf-8")
     
     # Configure Logfire to output OpenTelemetry spans locally
+    # We set console formatting to WARNING so our info statements don't clutter the CLI UX
     logfire.configure(
         send_to_logfire=False, # Keep data strictly local
-        console=logfire.ConsoleOptions(min_log_level='info'),
+        console=logfire.ConsoleOptions(min_log_level='warning'),
         additional_span_processors=[
             SimpleSpanProcessor(ConsoleSpanExporter(out=log_file))
         ]
@@ -103,7 +151,7 @@ def load_environment() -> Dict[str, str]:
             os.environ[key_name] = clean_val
             
             if key_name == "ANTHROPIC_API_KEY":
-                print(f"-> [Debug] Loaded & Scrubbed Anthropic Key: {clean_val[:10]}... (Length: {len(clean_val)})")
+                logfire.info(f"Loaded & Scrubbed Anthropic Key: {clean_val[:10]}... (Length: {len(clean_val)})")
 
     return {
         "GITHUB_TOKEN": token,
@@ -113,12 +161,12 @@ def load_environment() -> Dict[str, str]:
     }
 
 # ---------------------------------------------------------
-# LLM ENGINE
+# LLM ENGINES
 # ---------------------------------------------------------
 
 def digest_issue_text(issue_title: str, issue_body: str, model_name: str) -> IssueDigest:
     """
-    Uses an LLM wrapped in Instructor to extract structured RAG metadata from an issue.
+    Step 1 LLM Call: Uses an LLM to extract structured RAG metadata from a raw issue.
     """
     client = instructor.from_litellm(litellm.completion)
     
@@ -147,34 +195,62 @@ def digest_issue_text(issue_title: str, issue_body: str, model_name: str) -> Iss
         error_msg = str(e)
         logfire.error("LLM parsing failed for issue. Error details: {error}", error=error_msg)
         
-        # Explicit trap for Deprecated / Not Found model errors
         if "not_found_error" in error_msg and "model" in error_msg:
             print("\n" + "!"*60)
             print("🚨 MODEL NOT FOUND ERROR 🚨")
             print(f"The API rejected the model name: '{model_name}'")
             print("Anthropic often deprecates older model versions. Please update your .env file.")
-            print("\n💡 QUICK FIX: Change your .env to:")
-            print("   MODEL_NAME=claude-3-5-haiku-20241022")
-            print("   OR")
-            print("   MODEL_NAME=gpt-4o-mini")
             print("!"*60 + "\n")
             
-        # Explicit trap for Anthropic's vague Authentication / Billing errors
         elif "invalid x-api-key" in error_msg or "authentication_error" in error_msg:
             print("\n" + "!"*60)
             print("🚨 ANTHROPIC AUTHENTICATION ERROR 🚨")
-            print("Anthropic actively rejected your key. If you are sure there are no typos,")
-            print("your account is likely locked. Free tier credits expire after 14 days,")
-            print("even if your balance shows $4.90 left.")
-            print("\n💡 QUICK FIX: Swap to OpenAI in your .env to continue testing!")
-            print("   MODEL_NAME=gpt-4o-mini")
-            print("   OPENAI_API_KEY=sk-...")
+            print("Anthropic actively rejected your key.")
             print("!"*60 + "\n")
             
-        return IssueDigest(
-            key_phrases=[issue_title], 
-            code_reasoning="None", 
-            code=["None"]
+        return IssueDigest(key_phrases=[issue_title], code_reasoning="None", code=["None"])
+
+def generate_triage_decision(context: TriageContext, model_name: str) -> TriageResult:
+    """
+    Step 2 LLM Call: Takes the fully enriched TriageContext and performs the 
+    final LLM call to determine issue severity, upstream dependencies, and draft replies.
+    """
+    client = instructor.from_litellm(litellm.completion)
+    
+    system_prompt = (
+        "You are a Senior Open Source Maintainer triaging incoming GitHub issues. "
+        "You have been provided with an enriched context payload containing the original issue, "
+        "extracted signals, and code/documentation snippets retrieved from the repository codebase. "
+        "Synthesize this information to provide a highly accurate, structured triage decision."
+    )
+    
+    # Dump the Pydantic schema to JSON so the LLM gets a perfectly formatted payload
+    user_prompt = f"=== ENRICHED TRIAGE CONTEXT ===\n{context.model_dump_json(indent=2)}"
+    
+    logfire.info("-> Executing final triage decision with Enriched Context.")
+    
+    try:
+        decision = client.chat.completions.create(
+            model=model_name,
+            response_model=TriageResult,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_retries=2
+        )
+        return decision
+    except Exception as e:
+        logfire.error("LLM final triage failed. Error details: {error}", error=str(e))
+        return TriageResult(
+            issue_summary="Triage failed due to API error.",
+            investigation_target="Unknown",
+            upstream_risk="Low",
+            triage_priority="Low",
+            triage_reasoning=f"API Error fallback: {str(e)}",
+            github_label="bug",
+            label_reasoning="API Error fallback.",
+            further_info_required=[]
         )
 
 # ---------------------------------------------------------
@@ -257,7 +333,8 @@ def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: in
                                 chunks.append({
                                     "section_header": f"{path} - {node.name}",
                                     "text": "\n".join(file_lines[start:end]),
-                                    "filepath": path
+                                    "filepath": path,
+                                    "line_number": node.lineno
                                 })
                 except Exception:
                     pass
@@ -279,14 +356,24 @@ def chunk_by_headers(markdown_text: str) -> List[Dict[str, str]]:
     for line in lines:
         if line.startswith('#'):
             if current_content:
-                chunks.append({"section_header": current_header, "text": " ".join(current_content).strip()})
+                chunks.append({
+                    "section_header": current_header, 
+                    "text": " ".join(current_content).strip(),
+                    "filepath": "README.md",
+                    "line_number": None
+                })
                 current_content = []
             current_header = re.sub(r'^#+\s*', '', line).strip()
         elif line.strip():
             current_content.append(line.strip())
             
     if current_content:
-        chunks.append({"section_header": current_header, "text": " ".join(current_content).strip()})
+        chunks.append({
+            "section_header": current_header, 
+            "text": " ".join(current_content).strip(),
+            "filepath": "README.md",
+            "line_number": None
+        })
     return chunks
 
 def search_repo_docs(query: str, chunks: List[Dict[str, str]], top_k: int = 2) -> List[Dict[str, str]]:
@@ -327,52 +414,86 @@ def main():
         "Accept": "application/vnd.github.v3+json"
     }
 
+    # Use standard prints for clean CLI UX; logfire records the same data invisibly
+    print(f"\n--- Initializing Triage Pipeline for {args.repo} ---")
     logfire.info("--- Initializing Triage Pipeline for {repo} ---", repo=args.repo)
     
+    # 1. Fetch Documentation
     readme_markdown = fetch_repo_readme(args.repo, headers)
     doc_chunks = chunk_by_headers(readme_markdown)
+    print(f"-> Parsed README into {len(doc_chunks)} distinct documentation chunks.")
     logfire.info("Parsed README into {count} chunks.", count=len(doc_chunks))
     
+    # 2. Fetch Codebase
     code_chunks = fetch_remote_python_chunks(args.repo, headers, max_files=args.max_code_files)
+    print(f"-> Indexed {len(code_chunks)} code chunks from the Abstract Syntax Tree (AST).")
     logfire.info("Indexed {count} code chunks.", count=len(code_chunks))
+    
+    # Combine everything into a unified search pool
+    all_chunks = doc_chunks + code_chunks
     
     page = 1
     while True:
+        print(f"\n=== Fetching Batch {page} ===")
         logfire.info("=== Fetching Batch {page} ===", page=page)
+        
         issues = fetch_github_issues(args.repo, headers, limit=args.page_size, page=page)
         
         if not issues:
+            print("\n[success] No more active issues found. Triage complete![/success]")
             logfire.info("No more active issues found. Triage complete!")
             break
             
         for i, sample_issue in enumerate(issues, 1):
             issue_title = sample_issue['title']
             issue_body = sample_issue.get('body', '')
+            
+            print(f"\n[Issue #{sample_issue['number']}] {issue_title}")
             logfire.info("[Test] Issue #{number}: {title}", number=sample_issue['number'], title=issue_title)
             
-            # 1. Digest the Issue Text
+            # --- PHASE 1: Digest the Issue Text ---
             digest = digest_issue_text(issue_title, issue_body, config["MODEL_NAME"])
+            logfire.info("Generated Phrases: {phrases}", phrases=', '.join(digest.key_phrases))
             
-            logfire.info("  -> Generated Phrases:  {phrases}", phrases=', '.join(digest.key_phrases))
-            logfire.info("  -> Extracted Code:     {code}", code=digest.code[0] if digest.code else 'None')
-            logfire.info("  -> LLM Reasoning:      {reasoning}", reasoning=digest.code_reasoning[:120] + '...')
-            
-            # 2. Search using LLM-extracted Key Phrases & Code (Query Rewriting)
-            # Filter out the "None" fallback if the LLM didn't find any code
+            # --- PHASE 2: Enriched RAG Search (Docs + Code) ---
             valid_code_terms = [c for c in digest.code if c.lower() != "none"]
-            
-            # Combine phrases and code terms into a dense semantic query
             combined_terms = digest.key_phrases + valid_code_terms
             search_query = " ".join(combined_terms)
             
-            logfire.info("  -> RAG Search Query:   '{query}'", query=search_query)
+            logfire.info("Enriched Search Query: '{query}'", query=search_query)
+            best_matches = search_repo_docs(search_query, all_chunks, top_k=2)
             
-            relevant_docs = search_repo_docs(search_query, doc_chunks, top_k=1)
-            logfire.info("  -> Docs Match:         '{match}'", match=relevant_docs[0]['section_header'] if relevant_docs else 'None')
-                
-            relevant_code = search_repo_docs(search_query, code_chunks, top_k=1)
-            logfire.info("  -> Code Match:         '{match}'", match=relevant_code[0]['section_header'] if relevant_code else 'None')
-        
+            # Format matches for context building
+            retrieved_chunks_payload = []
+            for match in best_matches:
+                retrieved_chunks_payload.append(RetrievedChunk(
+                    source_file=match.get('filepath', 'Unknown'),
+                    content=match['text'],
+                    line_number=match.get('line_number')
+                ))
+            
+            # --- PHASE 3: Final Triage Decision ---
+            triage_context = TriageContext(
+                issue_title=issue_title,
+                issue_body=issue_body,
+                extracted_key_phrases=digest.key_phrases,
+                extracted_code_references=digest.code,
+                retrieved_chunks=retrieved_chunks_payload
+            )
+            
+            decision = generate_triage_decision(triage_context, config["MODEL_NAME"])
+            
+            print("\n  [FINAL TRIAGE REPORT]")
+            print(f"  -> Summary:            {decision.issue_summary}")
+            print(f"  -> Investigate:        {decision.investigation_target}")
+            print(f"  -> Upstream Risk:      {decision.upstream_risk}")
+            print(f"  -> Priority:           {decision.triage_priority}")
+            print(f"  -> Priority Reasoning: {decision.triage_reasoning}")
+            print(f"  -> GitHub Label:       '{decision.github_label}' ({decision.label_reasoning})")
+            
+            missing_info_str = ", ".join(decision.further_info_required) if decision.further_info_required else "None"
+            print(f"  -> Missing Info:       {missing_info_str}")
+            
         print("\n" + "-"*50)
         user_input = input(f"Press [Enter] to fetch the next {args.page_size} issues, or type 'exit' to quit: ").strip().lower()
         if user_input == 'exit':
