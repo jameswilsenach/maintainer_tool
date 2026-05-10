@@ -85,8 +85,8 @@ class TriageResult(BaseModel):
     triage_reasoning: str = Field(
         description="Reasoning for the assigned triage priority and upstream risk."
     )
-    github_label: Literal["bug", "enhancement", "documentation"] = Field(
-        description="The most appropriate GitHub label for this issue."
+    github_label: Literal["bug", "enhancement", "documentation","invalid"] = Field(
+        description="The most appropriate GitHub label for this issue. Issues are invalid if they are requests for usage guidamce"
     )
     label_reasoning: str = Field(
         description="Reasoning for the chosen GitHub label."
