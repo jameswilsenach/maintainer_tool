@@ -94,14 +94,21 @@ def load_environment() -> Dict[str, str]:
         print("ERROR: GITHUB_TOKEN not found. Please check your .env file.")
         sys.exit(1)
         
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-    if anthropic_key:
-        print(f"-> [Debug] Loaded Anthropic Key: {anthropic_key[:10]}... (Length: {len(anthropic_key)})")
+    # Aggressively scrub API keys to prevent hidden space/quote errors
+    for key_name in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"]:
+        val = os.getenv(key_name)
+        if val:
+            # Strip quotes, newlines, and trailing spaces that cause 401 errors
+            clean_val = val.strip(' "\'\n\r')
+            os.environ[key_name] = clean_val
+            
+            if key_name == "ANTHROPIC_API_KEY":
+                print(f"-> [Debug] Loaded & Scrubbed Anthropic Key: {clean_val[:10]}... (Length: {len(clean_val)})")
 
     return {
         "GITHUB_TOKEN": token,
         "TARGET_REPO": os.getenv("TARGET_REPO"),
-        "MODEL_NAME": os.getenv("MODEL_NAME", "claude-3-haiku-20240307"),
+        "MODEL_NAME": os.getenv("MODEL_NAME", "claude-3-5-haiku-20241022"), # Pinned for reproducibility
         "GITHUB_API_URL": "https://api.github.com"
     }
 
@@ -137,8 +144,33 @@ def digest_issue_text(issue_title: str, issue_body: str, model_name: str) -> Iss
         )
         return digest
     except Exception as e:
-        # Logfire natively captures the error cleanly without blowing up the terminal
-        logfire.error("LLM parsing failed for issue. Error details: {e}", e=str(e))
+        error_msg = str(e)
+        logfire.error("LLM parsing failed for issue. Error details: {error}", error=error_msg)
+        
+        # Explicit trap for Deprecated / Not Found model errors
+        if "not_found_error" in error_msg and "model" in error_msg:
+            print("\n" + "!"*60)
+            print("🚨 MODEL NOT FOUND ERROR 🚨")
+            print(f"The API rejected the model name: '{model_name}'")
+            print("Anthropic often deprecates older model versions. Please update your .env file.")
+            print("\n💡 QUICK FIX: Change your .env to:")
+            print("   MODEL_NAME=claude-3-5-haiku-20241022")
+            print("   OR")
+            print("   MODEL_NAME=gpt-4o-mini")
+            print("!"*60 + "\n")
+            
+        # Explicit trap for Anthropic's vague Authentication / Billing errors
+        elif "invalid x-api-key" in error_msg or "authentication_error" in error_msg:
+            print("\n" + "!"*60)
+            print("🚨 ANTHROPIC AUTHENTICATION ERROR 🚨")
+            print("Anthropic actively rejected your key. If you are sure there are no typos,")
+            print("your account is likely locked. Free tier credits expire after 14 days,")
+            print("even if your balance shows $4.90 left.")
+            print("\n💡 QUICK FIX: Swap to OpenAI in your .env to continue testing!")
+            print("   MODEL_NAME=gpt-4o-mini")
+            print("   OPENAI_API_KEY=sk-...")
+            print("!"*60 + "\n")
+            
         return IssueDigest(
             key_phrases=[issue_title], 
             code_reasoning="None", 
@@ -325,8 +357,15 @@ def main():
             logfire.info("  -> Extracted Code:     {code}", code=digest.code[0] if digest.code else 'None')
             logfire.info("  -> LLM Reasoning:      {reasoning}", reasoning=digest.code_reasoning[:120] + '...')
             
-            # 2. Search using LLM-extracted Key Phrases (Query Rewriting)
-            search_query = " ".join(digest.key_phrases)
+            # 2. Search using LLM-extracted Key Phrases & Code (Query Rewriting)
+            # Filter out the "None" fallback if the LLM didn't find any code
+            valid_code_terms = [c for c in digest.code if c.lower() != "none"]
+            
+            # Combine phrases and code terms into a dense semantic query
+            combined_terms = digest.key_phrases + valid_code_terms
+            search_query = " ".join(combined_terms)
+            
+            logfire.info("  -> RAG Search Query:   '{query}'", query=search_query)
             
             relevant_docs = search_repo_docs(search_query, doc_chunks, top_k=1)
             logfire.info("  -> Docs Match:         '{match}'", match=relevant_docs[0]['section_header'] if relevant_docs else 'None')
