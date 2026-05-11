@@ -27,7 +27,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExpor
 # ---------------------------------------------------------
 # GLOBAL DEFAULTS
 # ---------------------------------------------------------
-PAGE_SIZE = 5            # Number of issues to fetch per interactive batch (set to 1 for debugging/compute saving)
+PAGE_SIZE = 2            # Number of issues to fetch per interactive batch (set to 1 for debugging/compute saving)
 MAX_PAGE_SIZE = 10       # Hard cap on batch size to prevent accidental API credit burn
 MAX_CODE_FILES = 200     # Maximum number of remote Python files to parse via AST
 
@@ -307,6 +307,12 @@ def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: in
                 progress.advance(task)
                 
         # Emit a comprehensive observability metric for the AST phase
+        summary_msg = (
+            f"AST Extraction Summary: Parsed {parsed_files_count}/{len(target_files)} targeted files "
+            f"(out of {len(py_files)} total .py files). "
+            f"Extracted {node_counts['ClassDef']} classes, {node_counts['FunctionDef']} functions, "
+            f"and {node_counts['AsyncFunctionDef']} async functions."
+        )
         logfire.info(
             "AST Extraction Summary: Parsed {parsed_count}/{target_count} targeted files (out of {total_count} total .py files). "
             "Extracted {class_count} classes, {func_count} functions, and {async_func_count} async functions.",
@@ -317,6 +323,7 @@ def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: in
             func_count=node_counts["FunctionDef"],
             async_func_count=node_counts["AsyncFunctionDef"]
         )
+        print(f"-> {summary_msg}")
         return chunks
     except Exception:
         return []

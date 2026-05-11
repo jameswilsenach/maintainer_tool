@@ -74,7 +74,7 @@ The triage engine fetches open issues and performs a two-pass LLM analysis. Beca
 | Option | Description | Default | 
 | ----- | ----- | ----- | 
 | `--repo` | The GitHub repository (owner/repo). | None | 
-| `--page_size` | Number of valid issues to process in one batch (Max: 10). | 3 | 
+| `--page_size` | Number of valid issues to process in one batch (Max: 10). | 2 | 
 | `--start_issue` | Starting issue number. Skips any issues newer than this. | None | 
 | `--max_code_files` | Max remote Python files to index via AST for RAG. | 200 | 
 | `--include_labeled` | If true, processes issues that already have labels. | False | 
