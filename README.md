@@ -52,7 +52,7 @@ You will need to specify a github token to avoid API rate limiting.
 ```
 GITHUB_TOKEN=your_github_token_here
 ```
-# --- LLM Configuration ---
+### LLM Configurations:
 ```
 # Options: claude-3-5-haiku-20241022 (Default), gpt-4o-mini, etc.
 MODEL_NAME=claude-3-5-haiku-20241022
@@ -80,9 +80,10 @@ The triage engine fetches open issues and performs a two-pass LLM analysis. Beca
 | `--include_labeled` | If true, processes issues that already have labels. | False | 
 
 ### Example
-
-# Triage 5 unlabeled issues from Scanpy starting from issue #1500
+Triage 5 unlabeled issues from scanpy fork:
+```
 python main.py --repo jameswilsenach/scanpy --page_size 3
+```
 
 ### Outputs
 
@@ -107,12 +108,14 @@ Once you have generated a JSON report, use this tool to create specialized sub-r
 
 ### Example
 
-# Filter the latest report for high priority and upstream risks
+Filter the latest report for high priority and upstream risks
+```
 python query_reports.py --repo jameswilsenach/scanpy --high_priority --high_upstream
+```
 
 ## 5. Technical Design Principles
 
 * Parsimonious RAG: Uses Remote AST parsing to extract function and class definitions directly from GitHub, providing code-level context without requiring a local clone.
 * Structured Output: Uses Pydantic and Instructor to guarantee that triage decisions (priority, risk, labels) follow a strict schema.
 * Traceability: Every report entry includes the specific RAG chunks (file and line number) used by the LLM to make the decision.
-* Bounded Behavior: Implements hard caps on batch sizes and file indexing to ensure limit compute and protect API credit overuse.
+* Bounded Behavior: Implements hard caps on batch sizes and file indexing to limit compute and protect API credit overuse.
