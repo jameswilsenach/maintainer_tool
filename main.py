@@ -1,6 +1,7 @@
 """
-GitHub Issue Triage System for Open Source Maintainers
+GitHub Issue Triage Agent
 Fetches open issues via GitHub API, retrieves repo context, and uses an LLM to triage.
+Follows Google Python Style Guide.
 """
 
 import os
@@ -101,7 +102,7 @@ class TriageResult(BaseModel):
 # ---------------------------------------------------------
 
 def setup_logging(repo: str):
-    """Configures Logfire to write to a local file. Each run creates a new log file with a timestamp."""
+    """Configures Logfire to write to a local file. Removes noisy LiteLLM stdout."""
     litellm.suppress_debug_info = True
 
     os.makedirs("logs", exist_ok=True)
@@ -255,7 +256,6 @@ def fetch_github_issues(repo: str, headers: Dict[str, str], limit: int = 30, pag
         sys.exit(1)
 
 def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: int = 200) -> List[Dict[str, str]]:
-    """Fetches Python files from the repository, parses them with AST, and extracts relevant code chunks."""
     try:
         repo_info = requests.get(f"https://api.github.com/repos/{repo}", headers=headers, timeout=10).json()
         branch = repo_info.get("default_branch", "main")
@@ -331,7 +331,7 @@ def search_repo_docs(query: str, chunks: List[Dict[str, str]], top_k: int = 2) -
         chunk_words = set(chunk["text"].lower().split()) | set(chunk["section_header"].lower().split())
         overlap = len(query_terms.intersection(chunk_words))
         
-        # Only keep chunks that actually have matching terms
+        # Only keep chunks that actually have matching terms!
         if overlap > 0:
             scored_chunks.append((overlap, chunk))
         
@@ -355,8 +355,8 @@ def main():
 
     # Safeguard to prevent accidental API credit burn
     if args.page_size > MAX_PAGE_SIZE:
-        print(f"Warning: --page_size {args.page_size} exceeds the maximum limit.")
-        print(f"Capping batch size at {MAX_PAGE_SIZE} to conserve API credits.")
+        print(f"⚠️  Warning: --page_size {args.page_size} exceeds the maximum limit.")
+        print(f"   Capping batch size at {MAX_PAGE_SIZE} to conserve API credits.")
         args.page_size = MAX_PAGE_SIZE
 
     if not args.repo:
@@ -447,7 +447,21 @@ def main():
             
             best_matches = search_repo_docs(search_query, all_chunks, top_k=2)
             retrieved_chunks_payload = []
+            
+            # 1. ALWAYS inject the first README chunk to ground the LLM in the repo's purpose
+            if doc_chunks:
+                retrieved_chunks_payload.append(RetrievedChunk(
+                    source_file="README.md (Repository Overview)",
+                    content=doc_chunks[0]['text'],
+                    line_number=None
+                ))
+                
+            # 2. Inject the semantic search matches
             for match in best_matches:
+                # Prevent duplication if the search naturally pulled the overview chunk
+                if doc_chunks and match['text'] == doc_chunks[0]['text']:
+                    continue
+                    
                 retrieved_chunks_payload.append(RetrievedChunk(
                     source_file=match.get('filepath', 'Unknown'),
                     content=match['text'],
