@@ -330,7 +330,10 @@ def search_repo_docs(query: str, chunks: List[Dict[str, str]], top_k: int = 2) -
     for chunk in chunks:
         chunk_words = set(chunk["text"].lower().split()) | set(chunk["section_header"].lower().split())
         overlap = len(query_terms.intersection(chunk_words))
-        scored_chunks.append((overlap, chunk))
+        
+        # Only keep chunks that actually have matching terms
+        if overlap > 0:
+            scored_chunks.append((overlap, chunk))
         
     scored_chunks.sort(key=lambda x: x[0], reverse=True)
     return [c[1] for c in scored_chunks[:top_k]]
