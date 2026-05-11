@@ -21,9 +21,9 @@ This suite provides a production-grade, AI-powered pipeline for triaging GitHub 
 1. Clone the repository to your local machine.
 
 2. Create and activate a Python 3.11 virtual environment:
-   python3.11 -m venv venv
    ```
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   python3.11 -m venv triage-agent
+   source triage-agent/bin/activate  # On Windows CMD: triage-agent\Scripts\activate
    ```
 
    or in conda:
