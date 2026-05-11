@@ -270,6 +270,9 @@ def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: in
         if not target_files: return []
         
         chunks = []
+        parsed_files_count = 0
+        node_counts = {"ClassDef": 0, "FunctionDef": 0, "AsyncFunctionDef": 0}
+        
         file_headers = headers.copy()
         file_headers["Accept"] = "application/vnd.github.v3.raw"
         
@@ -285,6 +288,11 @@ def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: in
                         file_lines = content.split('\n')
                         for node in module.body:
                             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                                # Track exactly what type of chunk we are extracting
+                                if isinstance(node, ast.ClassDef): node_counts["ClassDef"] += 1
+                                elif isinstance(node, ast.FunctionDef): node_counts["FunctionDef"] += 1
+                                elif isinstance(node, ast.AsyncFunctionDef): node_counts["AsyncFunctionDef"] += 1
+                                
                                 start = node.lineno - 1
                                 end = node.end_lineno if hasattr(node, 'end_lineno') and node.end_lineno else start + 10
                                 chunks.append({
@@ -293,9 +301,22 @@ def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: in
                                     "filepath": path,
                                     "line_number": node.lineno
                                 })
+                        parsed_files_count += 1
                 except Exception:
                     pass
                 progress.advance(task)
+                
+        # Emit a comprehensive observability metric for the AST phase
+        logfire.info(
+            "AST Extraction Summary: Parsed {parsed_count}/{target_count} targeted files (out of {total_count} total .py files). "
+            "Extracted {class_count} classes, {func_count} functions, and {async_func_count} async functions.",
+            parsed_count=parsed_files_count,
+            target_count=len(target_files),
+            total_count=len(py_files),
+            class_count=node_counts["ClassDef"],
+            func_count=node_counts["FunctionDef"],
+            async_func_count=node_counts["AsyncFunctionDef"]
+        )
         return chunks
     except Exception:
         return []
