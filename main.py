@@ -1,7 +1,6 @@
 """
-GitHub Issue Triage Agent
+GitHub Issue Triage System for Open Source Maintainers
 Fetches open issues via GitHub API, retrieves repo context, and uses an LLM to triage.
-Follows Google Python Style Guide.
 """
 
 import os
@@ -102,7 +101,7 @@ class TriageResult(BaseModel):
 # ---------------------------------------------------------
 
 def setup_logging(repo: str):
-    """Configures Logfire to write to a local file. Removes noisy LiteLLM stdout."""
+    """Configures Logfire to write to a local file. Each run creates a new log file with a timestamp."""
     litellm.suppress_debug_info = True
 
     os.makedirs("logs", exist_ok=True)
@@ -256,6 +255,7 @@ def fetch_github_issues(repo: str, headers: Dict[str, str], limit: int = 30, pag
         sys.exit(1)
 
 def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: int = 200) -> List[Dict[str, str]]:
+    """Fetches Python files from the repository, parses them with AST, and extracts relevant code chunks."""
     try:
         repo_info = requests.get(f"https://api.github.com/repos/{repo}", headers=headers, timeout=10).json()
         branch = repo_info.get("default_branch", "main")
