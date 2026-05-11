@@ -27,7 +27,8 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExpor
 # ---------------------------------------------------------
 # GLOBAL DEFAULTS
 # ---------------------------------------------------------
-PAGE_SIZE = 1            # Number of issues to fetch per interactive batch (set to 1 for debugging/compute saving)
+PAGE_SIZE = 5            # Number of issues to fetch per interactive batch (set to 1 for debugging/compute saving)
+MAX_PAGE_SIZE = 10       # Hard cap on batch size to prevent accidental API credit burn
 MAX_CODE_FILES = 200     # Maximum number of remote Python files to parse via AST
 
 # ---------------------------------------------------------
@@ -348,6 +349,12 @@ def main():
     parser.add_argument("--start_issue", type=int, default=None, help="Optional starting issue number. Newer issues will be skipped.")
     parser.add_argument("--include_labeled", action="store_true", help="If set, includes issues that already have labels (by default, labeled issues are skipped).")
     args = parser.parse_args()
+
+    # Safeguard to prevent accidental API credit burn
+    if args.page_size > MAX_PAGE_SIZE:
+        print(f"Warning: --page_size {args.page_size} exceeds the maximum limit.")
+        print(f"Capping batch size at {MAX_PAGE_SIZE} to conserve API credits.")
+        args.page_size = MAX_PAGE_SIZE
 
     if not args.repo:
         print("ERROR: No repository specified. Provide --repo or set TARGET_REPO in your .env")
