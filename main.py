@@ -27,7 +27,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExpor
 # ---------------------------------------------------------
 # GLOBAL DEFAULTS
 # ---------------------------------------------------------
-PAGE_SIZE = 2            # Number of issues to fetch per interactive batch (set to 1 for debugging/compute saving)
+PAGE_SIZE = 5            # Number of issues to fetch per interactive batch (set to 1 for debugging/compute saving)
 MAX_PAGE_SIZE = 10       # Hard cap on batch size to prevent accidental API credit burn
 MAX_CODE_FILES = 200     # Maximum number of remote Python files to parse via AST
 
@@ -270,7 +270,12 @@ def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: in
         if not target_files: return []
         
         chunks = []
-        parsed_files_count = 0
+        stats = {
+            "with_nodes": 0,
+            "empty_or_no_nodes": 0,
+            "failed_network": 0,
+            "failed_ast": 0
+        }
         node_counts = {"ClassDef": 0, "FunctionDef": 0, "AsyncFunctionDef": 0}
         
         file_headers = headers.copy()
@@ -284,44 +289,52 @@ def fetch_remote_python_chunks(repo: str, headers: Dict[str, str], max_files: in
                     resp = requests.get(file_url, headers=file_headers, timeout=5)
                     if resp.status_code == 200:
                         content = resp.text
-                        module = ast.parse(content)
-                        file_lines = content.split('\n')
-                        for node in module.body:
-                            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                                # Track exactly what type of chunk we are extracting
-                                if isinstance(node, ast.ClassDef): node_counts["ClassDef"] += 1
-                                elif isinstance(node, ast.FunctionDef): node_counts["FunctionDef"] += 1
-                                elif isinstance(node, ast.AsyncFunctionDef): node_counts["AsyncFunctionDef"] += 1
+                        try:
+                            module = ast.parse(content)
+                            file_lines = content.split('\n')
+                            nodes_found = 0
+                            
+                            for node in module.body:
+                                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                                    # Track exactly what type of chunk we are extracting
+                                    if isinstance(node, ast.ClassDef): node_counts["ClassDef"] += 1
+                                    elif isinstance(node, ast.FunctionDef): node_counts["FunctionDef"] += 1
+                                    elif isinstance(node, ast.AsyncFunctionDef): node_counts["AsyncFunctionDef"] += 1
+                                    
+                                    start = node.lineno - 1
+                                    end = node.end_lineno if hasattr(node, 'end_lineno') and node.end_lineno else start + 10
+                                    chunks.append({
+                                        "section_header": f"{path} - {node.name}",
+                                        "text": "\n".join(file_lines[start:end]),
+                                        "filepath": path,
+                                        "line_number": node.lineno
+                                    })
+                                    nodes_found += 1
+                                    
+                            if nodes_found > 0:
+                                stats["with_nodes"] += 1
+                            else:
+                                stats["empty_or_no_nodes"] += 1
                                 
-                                start = node.lineno - 1
-                                end = node.end_lineno if hasattr(node, 'end_lineno') and node.end_lineno else start + 10
-                                chunks.append({
-                                    "section_header": f"{path} - {node.name}",
-                                    "text": "\n".join(file_lines[start:end]),
-                                    "filepath": path,
-                                    "line_number": node.lineno
-                                })
-                        parsed_files_count += 1
+                        except Exception:
+                            stats["failed_ast"] += 1
+                    else:
+                        stats["failed_network"] += 1
                 except Exception:
-                    pass
+                    stats["failed_network"] += 1
                 progress.advance(task)
                 
         # Emit a comprehensive observability metric for the AST phase
         summary_msg = (
-            f"AST Extraction Summary: Parsed {parsed_files_count}/{len(target_files)} targeted files "
-            f"(out of {len(py_files)} total .py files). "
-            f"Extracted {node_counts['ClassDef']} classes, {node_counts['FunctionDef']} functions, "
-            f"and {node_counts['AsyncFunctionDef']} async functions."
+            f"AST Extraction: {stats['with_nodes']} files yielded chunks, "
+            f"{stats['empty_or_no_nodes']} had no classes/functions. "
+            f"[Failures: {stats['failed_network']} Network/API, {stats['failed_ast']} Syntax]"
         )
+        
         logfire.info(
-            "AST Extraction Summary: Parsed {parsed_count}/{target_count} targeted files (out of {total_count} total .py files). "
-            "Extracted {class_count} classes, {func_count} functions, and {async_func_count} async functions.",
-            parsed_count=parsed_files_count,
-            target_count=len(target_files),
-            total_count=len(py_files),
-            class_count=node_counts["ClassDef"],
-            func_count=node_counts["FunctionDef"],
-            async_func_count=node_counts["AsyncFunctionDef"]
+            "AST Extraction Summary: {stats} | Node Counts: {node_counts}",
+            stats=stats,
+            node_counts=node_counts
         )
         print(f"-> {summary_msg}")
         return chunks
