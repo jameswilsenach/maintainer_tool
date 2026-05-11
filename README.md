@@ -80,7 +80,7 @@ The triage engine fetches open issues and performs a two-pass LLM analysis. Beca
 | `--include_labeled` | If true, processes issues that already have labels. | False | 
 
 ### Example
-Triage 5 unlabeled issues from scanpy fork:
+Triage unlabeled issues from scanpy fork:
 ```
 python main.py --repo jameswilsenach/scanpy --page_size 3
 ```
