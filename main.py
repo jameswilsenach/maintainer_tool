@@ -27,7 +27,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExpor
 # ---------------------------------------------------------
 # GLOBAL DEFAULTS
 # ---------------------------------------------------------
-PAGE_SIZE = 5            # Number of issues to fetch per interactive batch (set to 1 for debugging/compute saving)
+PAGE_SIZE = 2            # Number of issues to fetch per interactive batch (set to 1 for debugging/compute saving)
 MAX_PAGE_SIZE = 10       # Hard cap on batch size to prevent accidental API credit burn
 MAX_CODE_FILES = 200     # Maximum number of remote Python files to parse via AST
 
